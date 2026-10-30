@@ -1,0 +1,18 @@
+spring:
+  application:
+    name: sisforhighload
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+
+counter:
+  min-view-duration: 2s
+  view-dedup-ttl: 1h
+
+grpc:
+  port: 9090
+
+fault:
+  enabled: false
+  failure-rate: 0.2
+  slow-response-rate: 0.1
+  slow-response-delay: 500ms
