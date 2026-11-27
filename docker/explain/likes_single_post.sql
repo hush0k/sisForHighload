@@ -1,0 +1,2 @@
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT count(*) FROM likes WHERE post_id = 500;

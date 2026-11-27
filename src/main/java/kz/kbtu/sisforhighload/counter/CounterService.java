@@ -2,18 +2,26 @@ package kz.kbtu.sisforhighload.counter;
 
 import kz.kbtu.sisforhighload.counter.exception.InvalidViewTokenException;
 import kz.kbtu.sisforhighload.counter.exception.ViewTooShortException;
+import kz.kbtu.sisforhighload.counter.repository.LikeCountRow;
+import kz.kbtu.sisforhighload.counter.repository.LikeRepository;
+import kz.kbtu.sisforhighload.counter.repository.PostCounterRepository;
+import kz.kbtu.sisforhighload.counter.repository.PostCounterRow;
+import kz.kbtu.sisforhighload.counter.repository.ViewDedupRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -21,22 +29,30 @@ public class CounterService {
 
     private final CounterProperties properties;
 
-    private final Map<Long, Set<Long>> likesByPost = new ConcurrentHashMap<>();
+    private final TuningProperties tuning;
 
-    private final Map<Long, AtomicLong> viewsByPost = new ConcurrentHashMap<>();
+    private final LikeRepository likeRepository;
+
+    private final PostCounterRepository postCounterRepository;
+
+    private final ViewDedupRepository viewDedupRepository;
 
     private final Map<String, ViewSession> viewSessions = new ConcurrentHashMap<>();
 
-    private final Map<String, Instant> lastCountedViews = new ConcurrentHashMap<>();
-
+    @Transactional
     public void likePost(long postId, long userId) {
-        likesByPost.computeIfAbsent(postId, id -> ConcurrentHashMap.newKeySet()).add(userId);
+        LocalDateTime now = utcNow();
+        int inserted = insertLike(postId, userId, now);
+        if (inserted > 0) {
+            postCounterRepository.incrementLikes(postId, now);
+        }
     }
 
+    @Transactional
     public void unlikePost(long postId, long userId) {
-        Set<Long> likedUsers = likesByPost.get(postId);
-        if (likedUsers != null) {
-            likedUsers.remove(userId);
+        int deleted = likeRepository.deleteLike(postId, userId);
+        if (deleted > 0) {
+            postCounterRepository.decrementLikes(postId, utcNow());
         }
     }
 
@@ -46,34 +62,64 @@ public class CounterService {
         return viewToken;
     }
 
+    @Transactional
     public void finishView(long postId, long userId, String viewToken) {
         ViewSession session = findValidSession(postId, userId, viewToken);
         Instant now = Instant.now();
         ensureViewLongEnough(session, now);
 
-        String dedupKey = postId + ":" + userId;
-        Instant countedAt = lastCountedViews.compute(dedupKey,
-                (key, previous) -> isDedupActive(previous, now) ? previous : now);
-
-        boolean isNewView = countedAt.equals(now);
-        if (isNewView) {
-            viewsByPost.computeIfAbsent(postId, id -> new AtomicLong()).incrementAndGet();
+        LocalDateTime countedAt = toUtc(now);
+        LocalDateTime threshold = toUtc(now.minus(properties.viewDedupTtl()));
+        int changed = viewDedupRepository.upsertIfExpired(postId, userId, countedAt, threshold);
+        if (changed > 0) {
+            postCounterRepository.incrementViews(postId, countedAt);
         }
     }
 
+    @Transactional(readOnly = true)
     public CounterSnapshot getCounters(long postId, long userId) {
-        Set<Long> likedUsers = likesByPost.getOrDefault(postId, Set.of());
-        AtomicLong views = viewsByPost.get(postId);
-        long viewCount = views == null ? 0 : views.get();
-        return new CounterSnapshot(postId, likedUsers.size(), viewCount, likedUsers.contains(userId));
+        return getCountersBatch(List.of(postId), userId).get(0);
     }
 
+    @Transactional(readOnly = true)
     public List<CounterSnapshot> getCountersBatch(List<Long> postIds, long userId) {
-        List<CounterSnapshot> result = new ArrayList<>(postIds.size());
-        for (Long postId : postIds) {
-            result.add(getCounters(postId, userId));
+        Long[] ids = postIds.toArray(Long[]::new);
+        Map<Long, PostCounterRow> counters = loadCounters(ids);
+        Map<Long, Long> likes = loadLikes(ids, counters);
+        Set<Long> likedByMe = Set.copyOf(likeRepository.findLikedPostIds(userId, ids));
+        return postIds.stream()
+                .map(postId -> toSnapshot(postId, counters.get(postId), likes, likedByMe))
+                .toList();
+    }
+
+    private int insertLike(long postId, long userId, LocalDateTime now) {
+        if (tuning.hasPrimaryKey()) {
+            return likeRepository.insertOnConflictDoNothing(postId, userId, now);
         }
-        return result;
+        return likeRepository.insertIfAbsent(postId, userId, now);
+    }
+
+    private Map<Long, PostCounterRow> loadCounters(Long[] ids) {
+        return postCounterRepository.findCountersByPostIds(ids).stream()
+                .collect(Collectors.toMap(PostCounterRow::getPostId, row -> row));
+    }
+
+    private Map<Long, Long> loadLikes(Long[] ids, Map<Long, PostCounterRow> counters) {
+        Map<Long, Long> likes = new HashMap<>();
+        if (tuning.countersFromTable()) {
+            counters.forEach((postId, row) -> likes.put(postId, row.getLikesCount()));
+            return likes;
+        }
+        for (LikeCountRow row : likeRepository.countLikesByPostIds(ids)) {
+            likes.put(row.getPostId(), row.getLikesCount());
+        }
+        return likes;
+    }
+
+    private CounterSnapshot toSnapshot(long postId, PostCounterRow counter,
+                                       Map<Long, Long> likes, Set<Long> likedByMe) {
+        long views = counter == null ? 0 : counter.getViewsCount();
+        return new CounterSnapshot(postId, likes.getOrDefault(postId, 0L), views, likedByMe.contains(postId));
     }
 
     private ViewSession findValidSession(long postId, long userId, String viewToken) {
@@ -91,8 +137,11 @@ public class CounterService {
         }
     }
 
-    private boolean isDedupActive(Instant previous, Instant now) {
-        return previous != null
-                && Duration.between(previous, now).compareTo(properties.viewDedupTtl()) < 0;
+    private LocalDateTime utcNow() {
+        return toUtc(Instant.now());
+    }
+
+    private LocalDateTime toUtc(Instant instant) {
+        return LocalDateTime.ofInstant(instant, ZoneOffset.UTC);
     }
 }

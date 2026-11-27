@@ -1,0 +1,10 @@
+target
+.git
+.idea
+.vscode
+.mvn/wrapper/*.jar
+benchmark-results
+.env
+docker
+k6
+*.md

@@ -3,6 +3,24 @@ spring:
     name: sisforhighload
   jackson:
     property-naming-strategy: SNAKE_CASE
+  datasource:
+    url: jdbc:postgresql://localhost:5432/sisforhighload
+    username: sis
+    password: sis
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none
+  flyway:
+    enabled: true
+    url: ${spring.datasource.url}
+    user: ${spring.datasource.username}
+    password: ${spring.datasource.password}
+
+tuning:
+  stage: 0
+  pool-size: 10
+  replica-url:
 
 counter:
   min-view-duration: 2s

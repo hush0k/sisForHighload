@@ -1,0 +1,6 @@
+BEGIN;
+EXPLAIN (ANALYZE, BUFFERS)
+INSERT INTO likes (post_id, user_id, created_at)
+SELECT 500, 5000001, now() AT TIME ZONE 'UTC'
+WHERE NOT EXISTS (SELECT 1 FROM likes WHERE post_id = 500 AND user_id = 5000001);
+ROLLBACK;

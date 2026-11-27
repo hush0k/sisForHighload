@@ -1,0 +1,95 @@
+x-postgres-settings: &postgres-settings
+  - postgres
+  - -c
+  - shared_buffers=512MB
+  - -c
+  - max_connections=200
+  - -c
+  - wal_level=replica
+  - -c
+  - max_wal_senders=10
+  - -c
+  - hot_standby=on
+
+services:
+  postgres-primary:
+    image: postgres:18
+    command: *postgres-settings
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD}
+    ports:
+      - "${PRIMARY_PORT}:5432"
+    volumes:
+      - primary-data:/var/lib/postgresql
+      - ./docker/primary:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  postgres-replica:
+    image: postgres:18
+    entrypoint: ["/replica/entrypoint.sh"]
+    command: *postgres-settings
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD}
+    ports:
+      - "${REPLICA_PORT}:5432"
+    volumes:
+      - replica-data:/var/lib/postgresql
+      - ./docker/replica:/replica:ro
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  app:
+    build: .
+    profiles: ["app"]
+    environment:
+      SPRING_PROFILES_ACTIVE: ${APP_PROFILE:-default}
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-primary:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      TUNING_STAGE: ${TUNING_STAGE:-5}
+      TUNING_POOL_SIZE: ${TUNING_POOL_SIZE:-10}
+      TUNING_REPLICA_URL: jdbc:postgresql://postgres-replica:5432/${POSTGRES_DB}
+      BENCH_POSTS: ${POSTS:-1000000}
+      BENCH_USERS: ${USERS:-1000000}
+      BENCH_LIKES_PER_POST: ${LIKES_PER_POST:-20}
+    ports:
+      - "${APP_PORT}:8080"
+      - "${GRPC_PORT}:9090"
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      postgres-replica:
+        condition: service_healthy
+
+  k6:
+    image: grafana/k6
+    profiles: ["bench"]
+    restart: "no"
+    entrypoint: ["k6"]
+    environment:
+      BASE_URL: http://app:8080
+      POSTS: ${POSTS:-1000000}
+      USERS: ${USERS:-1000000}
+    volumes:
+      - ./k6:/scripts:ro
+      - ./benchmark-results:/results
+
+volumes:
+  primary-data:
+  replica-data:
